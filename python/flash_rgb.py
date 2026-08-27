@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 Flash the whole panel red -> green -> blue -> repeat, as a bring-up smoke
-test for jpeg_bridge.py.
+test for bridge.py.
 
-  ./python/jpeg_bridge.py &
+  sudo ./python/bridge.py --iface eth0 &
   ./python/flash_rgb.py
 """
 
 import argparse
-import io
 import socket
 import time
 
+import numpy as np
 from PIL import Image
 
 COLORS = [
@@ -22,7 +22,7 @@ COLORS = [
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Flash the panel red/green/blue via jpeg_bridge.py.")
+    ap = argparse.ArgumentParser(description="Flash the panel red/green/blue via bridge.py.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--canvas", default="192x192", help="WxH, must match the bridge's --canvas")
@@ -38,9 +38,7 @@ def main():
         while True:
             for name, rgb in COLORS:
                 img = Image.new("RGB", (w, h), rgb)
-                blob = io.BytesIO()
-                img.save(blob, "JPEG", quality=95)
-                data = blob.getvalue()
+                data = np.asarray(img, dtype=np.uint8).tobytes()
 
                 print(name)
                 deadline = time.monotonic() + args.hold

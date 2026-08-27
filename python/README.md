@@ -1,16 +1,17 @@
-# JPEG Bridge
+# Raw Bridge
 
-Stream JPEG frames over a socket to a ColorLight 5A-75B / 5A-75E receiver card.
+Stream raw RGB pixel buffers over a socket to a ColorLight 5A-75B / 5A-75E
+receiver card.
 
 `bridge.py` sits between your animation program and the receiver card. You
-send it JPEGs; it decodes them, arranges the pixels the way the receiver card
-expects, and sends them straight out over a raw Ethernet socket. There is no
-daemon and no shared memory -- `bridge.py` is the only thing that touches the
-NIC.
+send it raw pixels; it arranges them the way the receiver card expects and
+sends them straight out over a raw Ethernet socket. No JPEG, no compression,
+no daemon, no shared memory -- `bridge.py` is the only thing that touches the
+NIC, and there is no encode/decode step anywhere in the pipeline.
 
 ```
-your program ──JPEG over TCP──► bridge.py ──raw Ethernet──► panels
-                                  (root)
+your program ──raw RGB over TCP──► bridge.py ──raw Ethernet──► panels
+                                     (root)
 ```
 
 Anything that can write to a socket can drive the display: ffmpeg, a Python
@@ -47,10 +48,10 @@ no error if they disagree -- you just get garbage.
 sudo apt install python3-numpy python3-pil
 ```
 
-Pillow is doing the JPEG decoding through libjpeg-turbo -- the same C library a
-C++ version would use, so decoding runs at full native speed. numpy keeps the
-pixel rearranging out of the Python interpreter. Both matter; see
-[Performance](#performance).
+numpy does the pixel rearranging (block mapping) out of the Python
+interpreter. Pillow is only needed by the example senders (`bouncing_ball.py`
+etc.) to draw frames -- `bridge.py` itself doesn't touch it, since there's no
+image format to decode.
 
 ## 3. Start the bridge
 
@@ -65,42 +66,47 @@ The defaults are already 192x192 with no remapping. It prints what it's using
 and waits:
 
 ```
-receiver 192x192, canvas 192x192, mapping none, iface eth0
+receiver 192x192, canvas 192x192 (110592 bytes/frame, raw RGB), mapping none, iface eth0
 listening on 127.0.0.1:9000
 ```
 
 ## 4. Send it frames
 
-**From ffmpeg** -- no code at all. Scale to the panel size in ffmpeg, not in the
-bridge (this matters a lot, see [Performance](#performance)):
+Every frame is **exactly** `canvas_w * canvas_h * 3` bytes: row-major, 3 bytes
+per pixel, RGB. There is no header and no delimiter -- the bridge just reads
+that many bytes, sends them, and reads that many again. **Every frame must be
+exactly that size.** A wrongly-sized frame desyncs the stream permanently
+(every following frame gets torn across the wrong byte boundaries) until you
+reconnect.
+
+**From ffmpeg** -- no code at all. Scale to the panel size in ffmpeg, and
+output `rawvideo` in `rgb24`:
 
 ```bash
 # a video file
-ffmpeg -re -i clip.mp4 -vf scale=192:192 -f mjpeg -q:v 5 tcp://127.0.0.1:9000
+ffmpeg -re -i clip.mp4 -vf scale=192:192 -pix_fmt rgb24 -f rawvideo tcp://127.0.0.1:9000
 
 # a webcam, cropped square
 ffmpeg -f v4l2 -i /dev/video0 -vf "crop=min(iw\,ih):min(iw\,ih),scale=192:192" \
-       -f mjpeg tcp://127.0.0.1:9000
+       -pix_fmt rgb24 -f rawvideo tcp://127.0.0.1:9000
 
 # a still image, held on screen
-ffmpeg -loop 1 -r 1 -i logo.png -vf scale=192:192 -f mjpeg tcp://127.0.0.1:9000
+ffmpeg -loop 1 -r 30 -i logo.png -vf scale=192:192 -pix_fmt rgb24 -f rawvideo tcp://127.0.0.1:9000
 ```
 
 `-re` throttles playback to real time. Without it ffmpeg pushes frames as fast
 as it can decode them.
 
-**From Python** -- send whole JPEGs back to back:
+**From Python** -- send raw pixels back to back:
 
 ```python
-import io, socket
-from PIL import Image
+import socket
+import numpy as np
 
 sock = socket.create_connection(("127.0.0.1", 9000))
 
-def show(img):                       # img is a 192x192 PIL Image
-    blob = io.BytesIO()
-    img.save(blob, "JPEG", quality=85)
-    sock.sendall(blob.getvalue())
+def show(img):                       # img is a 192x192 PIL Image, mode "RGB"
+    sock.sendall(np.asarray(img, dtype=np.uint8).tobytes())
 
 while True:
     show(render_next_frame())
@@ -122,25 +128,14 @@ my_animation | sudo ./python/bridge.py --iface eth0 --stdin
 | Flag | Default | Notes |
 |---|---|---|
 | `--iface IFACE` | *(required)* | NIC wired to the receiver card, e.g. `eth0` |
-| `--canvas WxH` | `192x192` | size of the frames you are sending |
+| `--canvas WxH` | `192x192` | exact size of every frame you send; each frame is `W*H*3` raw RGB bytes |
 | `--receiver WxH` | same as `--canvas` | the receiver card's actual configured resolution |
 | `--mapping` | `none` | `none` sends pixels straight through. See below. |
 | `--port N` | `9000` | TCP port to listen on |
 | `--bind ADDR` | `127.0.0.1` | use `0.0.0.0` to accept frames from other machines |
 | `--stdin` | off | read the stream from stdin instead of a socket |
-| `--fit` | `stretch` | `contain` preserves aspect ratio and letterboxes with black |
 | `--brightness N` | `100` | 0-100, fixed for the life of the process |
 | `--quiet` | off | suppress the throughput line printed every 5s |
-
-### Framing
-
-Auto-detected per connection, so you do not configure it:
-
-- **Back-to-back JPEGs** -- each frame starts `FF D8` and ends `FF D9`. This is
-  what `ffmpeg -f mjpeg` emits and what the Python snippet above sends.
-- **Length-prefixed** -- a 4-byte big-endian length before each JPEG. Slightly
-  more robust: a JPEG carrying an EXIF thumbnail can contain an early `FF D9`,
-  which costs one dropped frame in the first mode before it resynchronizes.
 
 ### `--mapping none` vs `blocks`
 
@@ -161,32 +156,23 @@ silently displaying nonsense.
 
 ## Performance
 
-Measured on Apple Silicon. A Pi 4 is roughly 3-5x slower, so divide.
+There is no decode step -- a raw frame goes straight from the socket into a
+numpy array. The only per-frame cost is the block-mapping copy (a no-op memcpy
+in `--mapping none`) and building/sending the Ethernet packets, which
+`bridge.py` batches into a single `sendmmsg()` syscall per frame so the kernel
+transmits every packet in a still frame back-to-back.
 
-| Workload | Decode | Map + copy | Total | Ceiling |
-|---|---|---|---|---|
-| **192x192 source → 192x192** | 0.203 ms | 0.071 ms | **0.274 ms** | ~3,650 fps |
-| 128x16 source → 128x16 | 0.052 ms | 0.008 ms | 0.060 ms | ~16,700 fps |
-| **1920x1080 source → 128x16** | **7.69 ms** | 0.005 ms | 7.695 ms | ~130 fps |
-
-That third row is the one to pay attention to. Decoding a 1080p JPEG costs
-about 150x more than everything else in the pipeline combined, because
-entropy-decoding two million pixels is unavoidable work even when you throw
-almost all of them away. On a Pi that is the difference between comfortable and
-struggling. **Always scale to 192x192 in ffmpeg**, so the bridge only ever sees
-small JPEGs.
-
-Unlike the older daemon-backed design, there is no fixed polling interval
-here -- `bridge.py` sends a frame as soon as it finishes decoding and mapping
-it, batching every packet of that frame into a single `sendmmsg()` syscall so
-the kernel transmits them back-to-back. The practical ceiling is then whatever
-is slower of your source (decode above) and the wire:
+The practical ceiling is then almost entirely the wire:
 
 - **Ethernet.** At 192x192 each frame is 192 packets of 597 bytes, about
   112 KB, so 60fps is **55 Mbit/s** and 30fps is **27 Mbit/s**. Fine on a Pi 4
   or 5 with real gigabit. A Pi 3 or earlier puts Ethernet behind USB2 at
   100 Mbit, where 60fps would be uncomfortably close to the ceiling -- use 30fps
   there, or use a newer Pi.
+- **TCP throughput for the raw stream itself.** At 192x192 and 60fps the
+  raw pixel stream between your program and `bridge.py` is about **53 Mbit/s**
+  (110,592 bytes/frame). That's trivial over loopback; only matters if you
+  push frames over a real network with `--bind 0.0.0.0`.
 
 ### Wiring
 
@@ -207,6 +193,12 @@ for everything else.
 `--receiver` (or `--canvas`, if `--receiver` is unset) disagrees with what you
 think it says. Remember it's WxH, and it must match what LEDVision has the
 card configured to.
+
+**The image tears, smears or scrolls sideways after the first frame or two.**
+Your sender is emitting the wrong number of bytes per frame -- check it's
+sending exactly `canvas_w * canvas_h * 3` bytes every time (no JPEG encoding,
+no extra header). Once the stream desyncs like this the only fix is to
+reconnect.
 
 **Nothing on the panels, but the bridge reports frames flowing.**
 Check the interface name against `ip link`, and confirm packets are actually
@@ -234,5 +226,5 @@ paces the packets. Non-PWM panels are unaffected.
 sudo ./python/bridge.py --iface eth0
 
 # terminal 2
-ffmpeg -re -i clip.mp4 -vf scale=192:192 -f mjpeg tcp://127.0.0.1:9000
+ffmpeg -re -i clip.mp4 -vf scale=192:192 -pix_fmt rgb24 -f rawvideo tcp://127.0.0.1:9000
 ```

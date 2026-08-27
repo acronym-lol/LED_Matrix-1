@@ -2,17 +2,16 @@
 """
 Three bouncing balls (red, green, blue) -> bridge.py -> LED matrix.
 
-No daemon, no shared memory. This streams back-to-back JPEGs over TCP to
-bridge.py, which decodes them and sends them straight to the receiver card
-over a raw Ethernet socket. This is what acronym-logo-animation.service runs
-as the second half of its two-script pipeline.
+No daemon, no shared memory, no JPEG. This streams raw RGB pixel buffers
+over TCP to bridge.py, which sends them straight to the receiver card over a
+raw Ethernet socket. This is what acronym-logo-animation.service runs as the
+second half of its two-script pipeline.
 
   sudo ./python/bridge.py --iface eth0   # must already be running
   ./python/three_bouncing_balls.py
 """
 
 import argparse
-import io
 import socket
 import sys
 import time
@@ -101,9 +100,7 @@ def main():
                 ball.step(w, h)
                 ball.draw(draw)
 
-            blob = io.BytesIO()
-            img.save(blob, "JPEG", quality=85)
-            sock.sendall(blob.getvalue())
+            sock.sendall(np.asarray(img, dtype=np.uint8).tobytes())
 
             elapsed = time.monotonic() - t0
             if elapsed < frame_dt:

@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-JPEG -> ColorLight receiver card bridge, no daemon.
+Raw pixel buffer -> ColorLight receiver card bridge, no daemon.
 
-Accepts a stream of JPEG frames (TCP socket or stdin), decodes them, maps
-them onto the receiver card's pixel layout, and sends them straight to the
-card over a raw AF_PACKET Ethernet socket. There is no daemon and no shared
-memory -- this process alone owns the NIC and speaks the wire protocol.
+Accepts a stream of fixed-size raw RGB frames (TCP socket or stdin) and sends
+them straight to the card over a raw AF_PACKET Ethernet socket. No JPEG, no
+compression, no decode step -- each frame is exactly canvas_w * canvas_h * 3
+bytes, row-major, 3 bytes/pixel RGB (e.g. straight from
+`np.asarray(pil_image, dtype=np.uint8).tobytes()`). There is no daemon and no
+shared memory -- this process alone owns the NIC and speaks the wire protocol.
+
+Because there's no header and no delimiter, framing is just "read exactly
+canvas_w * canvas_h * 3 bytes, repeat" -- the sender MUST emit exactly that
+many bytes per frame, every frame. A wrongly-sized frame desyncs the stream
+permanently (every frame after it gets torn across the wrong boundaries)
+until the connection is dropped and reconnected.
 
 Wire protocol (reverse engineered from daemon/Linux_NetCard.cpp's
 send_frame(); dst MAC 11:22:33:44:55:66, src MAC 22:22:33:44:55:66, plain
@@ -37,20 +45,14 @@ Requires root (or CAP_NET_RAW) to open the raw socket -- run this as root,
 or as the only network-facing half of the pipeline; the sender half
 (three_bouncing_balls.py etc.) does not need any privilege.
 
-Framing on the TCP/stdin side is auto-detected from the first bytes of the
-stream:
-  * back-to-back JPEGs (starts with FFD8) -- what "ffmpeg -f mjpeg" produces
-  * 4-byte big-endian length prefix before each JPEG
-
 Example:
   sudo ./bridge.py --iface eth0 &
-  ffmpeg -re -i clip.mp4 -vf scale=192:192 -f mjpeg tcp://127.0.0.1:9000
+  ffmpeg -re -i clip.mp4 -vf scale=192:192 -pix_fmt rgb24 -f rawvideo tcp://127.0.0.1:9000
 """
 
 import argparse
 import ctypes
 import gc
-import io
 import os
 import socket
 import struct
@@ -58,12 +60,6 @@ import sys
 import time
 
 import numpy as np
-from PIL import Image
-
-SOI = b"\xff\xd8"
-EOI = b"\xff\xd9"
-
-MAX_FRAME_BYTES = 32 << 20
 
 DST_MAC = bytes.fromhex("112233445566")
 SRC_MAC = bytes.fromhex("222233445566")
@@ -229,35 +225,14 @@ def build_mapper(canvas_w, canvas_h, recv_w, recv_h, mode):
     return apply
 
 
-def decode(payload, canvas_w, canvas_h, fit):
-    img = Image.open(io.BytesIO(payload))
-    # Lets libjpeg decode straight to 1/2, 1/4 or 1/8 scale -- a big win when
-    # the source is 1080p and the panel is a few thousand pixels.
-    img.draft("RGB", (canvas_w, canvas_h))
-    img = img.convert("RGB")
+class RawFrameStream:
+    """Pulls fixed-size raw RGB frames out of a byte stream. No header, no
+    delimiter -- the frame size is known up front from --canvas."""
 
-    if img.size != (canvas_w, canvas_h):
-        if fit == "contain":
-            scale = min(canvas_w / img.width, canvas_h / img.height)
-            new = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
-            img = img.resize(new, Image.BILINEAR)
-            padded = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
-            padded.paste(img, ((canvas_w - new[0]) // 2, (canvas_h - new[1]) // 2))
-            img = padded
-        else:
-            img = img.resize((canvas_w, canvas_h), Image.BILINEAR)
-
-    return np.asarray(img)
-
-
-class JpegStream:
-    """Pulls whole JPEGs out of a byte stream, auto-detecting the framing."""
-
-    def __init__(self, recv):
+    def __init__(self, recv, frame_bytes):
         self._recv = recv
+        self._frame_bytes = frame_bytes
         self._buf = bytearray()
-        self._mode = None
-        self._scan = 0
 
     def _fill(self):
         chunk = self._recv(65536)
@@ -266,112 +241,58 @@ class JpegStream:
         self._buf += chunk
         return True
 
-    def _need(self, n):
-        while len(self._buf) < n:
-            if not self._fill():
-                return False
-        return True
-
-    def _take(self, n):
-        payload = bytes(self._buf[:n])
-        del self._buf[:n]
-        return payload
-
     def frames(self):
         while True:
-            if self._mode is None:
-                if not self._need(4):
-                    return
-                self._mode = "mjpeg" if self._buf[:2] == SOI else "length"
-
-            if self._mode == "length":
-                if not self._need(4):
-                    return
-                size = int.from_bytes(self._buf[:4], "big")
-                if size == 0 or size > MAX_FRAME_BYTES:
-                    raise SystemExit("bogus frame length %d -- framing lost" % size)
-                if not self._need(4 + size):
-                    return
-                del self._buf[:4]
-                yield self._take(size)
-                continue
-
-            # Back-to-back JPEGs: drop anything before SOI, then hunt for EOI.
-            start = self._buf.find(SOI)
-            while start < 0:
-                del self._buf[:-1]
+            while len(self._buf) < self._frame_bytes:
                 if not self._fill():
                     return
-                start = self._buf.find(SOI)
-            if start:
-                del self._buf[:start]
-                self._scan = 0
-
-            end = self._buf.find(EOI, max(2, self._scan))
-            while end < 0:
-                self._scan = max(2, len(self._buf) - 1)
-                if not self._fill():
-                    return
-                end = self._buf.find(EOI, self._scan)
-            self._scan = 0
-            yield self._take(end + 2)
+            payload = bytes(self._buf[:self._frame_bytes])
+            del self._buf[:self._frame_bytes]
+            yield payload
 
 
-def run(stream, matrix, mapper, args):
-    frames = dropped = 0
+def run(stream, matrix, mapper, canvas_w, canvas_h, quiet):
+    frames = 0
     last = time.monotonic()
 
     for payload in stream.frames():
-        try:
-            src = decode(payload, args.canvas_w, args.canvas_h, args.fit)
-        except Exception as exc:
-            # In mjpeg mode a JPEG carrying an EXIF thumbnail can trip an early
-            # EOI. We resync on the next SOI, costing one frame.
-            dropped += 1
-            if dropped < 5:
-                print("skipped a frame: %s" % exc, file=sys.stderr)
-            continue
-
+        src = np.frombuffer(payload, dtype=np.uint8).reshape(canvas_h, canvas_w, 3)
         matrix.send_frame(mapper(src))
         frames += 1
 
-        if not args.quiet:
+        if not quiet:
             now = time.monotonic()
             if now - last >= 5.0:
-                print(
-                    "%.1f fps (%d frames, %d dropped)"
-                    % (frames / (now - last), frames, dropped),
-                    file=sys.stderr,
-                )
+                print("%.1f fps (%d frames)" % (frames / (now - last), frames), file=sys.stderr)
                 frames = 0
                 last = now
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Stream JPEG frames straight to a ColorLight receiver card.")
+    ap = argparse.ArgumentParser(description="Stream raw RGB pixel buffers straight to a ColorLight receiver card.")
     ap.add_argument("--iface", required=True, help="NIC wired to the receiver card, e.g. eth0")
     ap.add_argument("--port", type=int, default=9000, help="TCP port to listen on (default 9000)")
     ap.add_argument("--bind", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
     ap.add_argument("--stdin", action="store_true", help="read the stream from stdin instead of a socket")
-    ap.add_argument("--canvas", default="192x192", help="size of the frames you send, as WxH (default 192x192)")
+    ap.add_argument("--canvas", default="192x192",
+                    help="exact size of every frame you send, as WxH (default 192x192). "
+                         "Frames are raw RGB, canvas_w*canvas_h*3 bytes each, no header.")
     ap.add_argument("--receiver", default=None,
                     help="receiver card resolution as WxH (default: same as --canvas). "
                          "Must match how the card is configured in LEDVision.")
     ap.add_argument("--mapping", choices=["blocks", "none"], default="none",
                     help="'blocks' matches Matrix::map_pixel; 'none' writes straight through")
-    ap.add_argument("--fit", choices=["stretch", "contain"], default="stretch",
-                    help="how to fit a mismatched source (default stretch)")
     ap.add_argument("--brightness", type=int, default=100, help="panel brightness 0-100 (default 100)")
     ap.add_argument("--quiet", action="store_true", help="do not print throughput")
     args = ap.parse_args()
 
     try:
-        args.canvas_w, args.canvas_h = (int(v) for v in args.canvas.lower().split("x"))
+        canvas_w, canvas_h = (int(v) for v in args.canvas.lower().split("x"))
     except ValueError:
         raise SystemExit("--canvas wants WxH, e.g. 128x16")
 
     if args.receiver is None:
-        recv_w, recv_h = args.canvas_w, args.canvas_h
+        recv_w, recv_h = canvas_w, canvas_h
     else:
         try:
             recv_w, recv_h = (int(v) for v in args.receiver.lower().split("x"))
@@ -379,11 +300,12 @@ def main():
             raise SystemExit("--receiver wants WxH, e.g. 192x192")
 
     matrix = RawMatrix(args.iface, rows=recv_h, cols=recv_w, brightness=args.brightness)
-    mapper = build_mapper(args.canvas_w, args.canvas_h, recv_w, recv_h, args.mapping)
+    mapper = build_mapper(canvas_w, canvas_h, recv_w, recv_h, args.mapping)
+    frame_bytes = canvas_w * canvas_h * 3
 
     print(
-        "receiver %dx%d, canvas %dx%d, mapping %s, iface %s"
-        % (recv_w, recv_h, args.canvas_w, args.canvas_h, args.mapping, args.iface),
+        "receiver %dx%d, canvas %dx%d (%d bytes/frame, raw RGB), mapping %s, iface %s"
+        % (recv_w, recv_h, canvas_w, canvas_h, frame_bytes, args.mapping, args.iface),
         file=sys.stderr,
     )
 
@@ -393,7 +315,7 @@ def main():
 
     try:
         if args.stdin:
-            run(JpegStream(sys.stdin.buffer.read), matrix, mapper, args)
+            run(RawFrameStream(sys.stdin.buffer.read, frame_bytes), matrix, mapper, canvas_w, canvas_h, args.quiet)
             return
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -407,7 +329,7 @@ def main():
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print("connected: %s:%d" % peer, file=sys.stderr)
             try:
-                run(JpegStream(conn.recv), matrix, mapper, args)
+                run(RawFrameStream(conn.recv, frame_bytes), matrix, mapper, canvas_w, canvas_h, args.quiet)
             finally:
                 conn.close()
                 print("disconnected", file=sys.stderr)

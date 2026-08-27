@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Bouncing ball -> jpeg_bridge.py smoke test.
+Bouncing ball -> bridge.py smoke test.
 
-Draws a simple bouncing ball animation and streams it as back-to-back JPEGs
-to the bridge's TCP socket, matching the default 192x192 canvas.
+Draws a simple bouncing ball animation and streams it as raw RGB pixel
+buffers to the bridge's TCP socket, matching the default 192x192 canvas.
 
-  ./python/jpeg_bridge.py &
+  sudo ./python/bridge.py --iface eth0 &
   ./python/bouncing_ball.py
 """
 
 import argparse
-import io
 import socket
 import time
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Stream a bouncing ball to jpeg_bridge.py.")
+    ap = argparse.ArgumentParser(description="Stream a bouncing ball to bridge.py.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--canvas", default="192x192", help="WxH, must match the bridge's --canvas")
@@ -64,9 +64,7 @@ def main():
             draw = ImageDraw.Draw(img)
             draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
-            blob = io.BytesIO()
-            img.save(blob, "JPEG", quality=85)
-            sock.sendall(blob.getvalue())
+            sock.sendall(np.asarray(img, dtype=np.uint8).tobytes())
 
             elapsed = time.monotonic() - t0
             if elapsed < frame_dt:
