@@ -91,47 +91,104 @@ _libc.sendmmsg.restype = ctypes.c_int
 _libc.sendmmsg.argtypes = [ctypes.c_int, ctypes.POINTER(_Mmsghdr), ctypes.c_uint, ctypes.c_uint]
 
 
-def _sendmmsg_batch(fd, frames):
-    """Hand every frame (a list of bytes objects) to the kernel in one syscall."""
-    n = len(frames)
-    if n == 0:
-        return
-
-    # ctypes.create_string_buffer copies do own the memory, so these can be
-    # discarded once sendmmsg() returns -- keep them alive until then.
-    bufs = [ctypes.create_string_buffer(data, len(data)) for data in frames]
-    iovecs = (_Iovec * n)()
-    mmsgs = (_Mmsghdr * n)()
-    for i, buf in enumerate(bufs):
-        iovecs[i].iov_base = ctypes.cast(buf, ctypes.c_void_p)
-        iovecs[i].iov_len = len(frames[i])
-        mmsgs[i].msg_hdr.msg_iov = ctypes.pointer(iovecs[i])
-        mmsgs[i].msg_hdr.msg_iovlen = 1
-
-    sent = _libc.sendmmsg(fd, mmsgs, n, 0)
-    if sent != n:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-
-
 class RawMatrix:
     """Talks directly to a 5A-75-style receiver card over a raw Ethernet
-    socket. No daemon, no shared memory."""
+    socket. No daemon, no shared memory.
+
+    Mirrors daemon/Linux_NetCard.cpp's send_frame(): that C++ code builds a
+    2-iovec sendmmsg() scatter/gather per row (a tiny header buffer plus a
+    pointer straight into the mmap'd shared-memory framebuffer for the pixel
+    bytes) and does zero per-frame allocation. Our first pass at this instead
+    rebuilt every packet and every ctypes structure from scratch each call
+    (~1.6ms just for packet construction, ~5.9ms per send_frame() total on a
+    Pi) -- slow enough, held open long enough on a still frame, that it could
+    race the receiver card's own scan-out and tear.
+
+    So: everything that doesn't change frame to frame -- header bytes, the
+    ctypes iovec/mmsghdr arrays -- is built once here at construction time.
+    self._bgr is a persistent buffer that the row-packet iovecs point into
+    directly; send_frame() only overwrites it in place and fires two
+    sendmmsg() syscalls. No per-frame allocation, no per-packet Python object
+    construction.
+    """
 
     def __init__(self, iface, rows, cols, brightness=100):
         self.rows = rows
         self.cols = cols
         self._raw_brightness = 0
         self._gamma_brightness = 0
-        self.set_brightness(brightness)
 
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         self.sock.bind((iface, 0))
+
+        # Overwritten in place every send_frame() call -- never reassigned,
+        # so its underlying memory address (and the iovec pointers into it
+        # built below) stay valid for the life of this object.
+        self._bgr = np.zeros((rows, cols, 3), dtype=np.uint8)
+        bgr_base = self._bgr.ctypes.data
+
+        chunks = []
+        for row in range(rows):
+            offset = 0
+            remaining = cols
+            while remaining > 0:
+                chunk = min(COLS_PER_PKT, remaining)
+                chunks.append((row, offset, chunk))
+                offset += chunk
+                remaining -= chunk
+        n = len(chunks)
+
+        # 2 iovecs per row packet (header, pixels-straight-from-self._bgr),
+        # plus 1 each for the enable/brightness packets at the tail.
+        self._iovecs = (_Iovec * (2 * n + 2))()
+        self._row_msgs = (_Mmsghdr * n)()
+        self._tail_msgs = (_Mmsghdr * 2)()
+        # ctypes.create_string_buffer copies own their memory -- keep them
+        # alive here, since the iovecs above only borrow pointers into them.
+        self._header_bufs = []
+
+        for i, (row, offset, chunk) in enumerate(chunks):
+            header = self._eth_header(0x5500 | (row >> 8)) + bytes((
+                row & 0xFF,
+                (offset >> 8) & 0xFF, offset & 0xFF,
+                (chunk >> 8) & 0xFF, chunk & 0xFF,
+                0x08, 0x88,
+            ))
+            buf = ctypes.create_string_buffer(header, len(header))
+            self._header_bufs.append(buf)
+
+            self._iovecs[2 * i].iov_base = ctypes.cast(buf, ctypes.c_void_p)
+            self._iovecs[2 * i].iov_len = len(header)
+            self._iovecs[2 * i + 1].iov_base = bgr_base + (row * cols + offset) * 3
+            self._iovecs[2 * i + 1].iov_len = chunk * 3
+
+            self._row_msgs[i].msg_hdr.msg_iov = ctypes.pointer(self._iovecs[2 * i])
+            self._row_msgs[i].msg_hdr.msg_iovlen = 2
+
+        self._tail_iov_base = 2 * n
+        for i in range(2):
+            self._tail_msgs[i].msg_hdr.msg_iov = ctypes.pointer(self._iovecs[self._tail_iov_base + i])
+            self._tail_msgs[i].msg_hdr.msg_iovlen = 1
+
+        self.set_brightness(brightness)
 
     def set_brightness(self, percent):
         percent = max(0, min(100, percent)) / 100.0
         self._raw_brightness = round(percent * 255)
         self._gamma_brightness = round((percent ** 0.405) * 255)
+
+        # Fixed for the life of the process in normal use, but rebuildable if
+        # something calls this again later -- cheap either way, only 2 packets.
+        enable = self._enable_frame()
+        brightness_pkt = self._brightness_frame()
+        self._enable_buf = ctypes.create_string_buffer(enable, len(enable))
+        self._brightness_buf = ctypes.create_string_buffer(brightness_pkt, len(brightness_pkt))
+
+        base = self._tail_iov_base
+        self._iovecs[base].iov_base = ctypes.cast(self._enable_buf, ctypes.c_void_p)
+        self._iovecs[base].iov_len = len(enable)
+        self._iovecs[base + 1].iov_base = ctypes.cast(self._brightness_buf, ctypes.c_void_p)
+        self._iovecs[base + 1].iov_len = len(brightness_pkt)
 
     @staticmethod
     def _eth_header(ethertype):
@@ -150,32 +207,21 @@ class RawMatrix:
         payload[2] = 0xFF
         return self._eth_header(0x0A00 + self._gamma_brightness) + bytes(payload)
 
-    def _row_frames(self, bgr):
-        """bgr: (rows, cols, 3) uint8 array, already in blue/green/red order."""
-        frames = []
-        for row in range(self.rows):
-            offset = 0
-            remaining = self.cols
-            while remaining > 0:
-                chunk = min(COLS_PER_PKT, remaining)
-                header = bytes((
-                    row & 0xFF,
-                    (offset >> 8) & 0xFF, offset & 0xFF,
-                    (chunk >> 8) & 0xFF, chunk & 0xFF,
-                    0x08, 0x88,
-                ))
-                pixels = bgr[row, offset:offset + chunk].tobytes()
-                frames.append(self._eth_header(0x5500 | (row >> 8)) + header + pixels)
-                offset += chunk
-                remaining -= chunk
-        return frames
-
     def send_frame(self, rgb):
         """rgb: (rows, cols, 3) uint8 array in RGB order (e.g. from PIL)."""
-        bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+        self._bgr[:] = rgb[:, :, ::-1]
         fd = self.sock.fileno()
-        _sendmmsg_batch(fd, self._row_frames(bgr))
-        _sendmmsg_batch(fd, [self._enable_frame(), self._brightness_frame()])
+
+        n = len(self._row_msgs)
+        sent = _libc.sendmmsg(fd, self._row_msgs, n, 0)
+        if sent != n:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+
+        sent = _libc.sendmmsg(fd, self._tail_msgs, 2, 0)
+        if sent != 2:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
 
     def close(self):
         self.sock.close()
