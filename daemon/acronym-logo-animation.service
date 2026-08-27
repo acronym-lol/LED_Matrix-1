@@ -1,0 +1,16 @@
+[Unit]
+Description=ACRONYM logo animation - LED matrix daemon + three bouncing balls
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/zongze/Documents/LED_Matrix-1
+ExecStartPre=/home/zongze/Documents/LED_Matrix-1/daemon/Matrix /home/zongze/Documents/LED_Matrix-1/daemon/config.txt
+ExecStartPre=/bin/sleep 1
+ExecStart=/usr/bin/python3 /home/zongze/Documents/LED_Matrix-1/python/three_bouncing_balls.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
