@@ -3,43 +3,23 @@
 Raw pixel buffer -> ColorLight receiver card bridge, no daemon.
 
 Accepts a stream of fixed-size raw RGB frames (TCP socket or stdin) and sends
-them straight to the card over a raw AF_PACKET Ethernet socket. No JPEG, no
+them straight to the card over a raw Ethernet socket. No JPEG, no
 compression, no decode step -- each frame is exactly canvas_w * canvas_h * 3
 bytes, row-major, 3 bytes/pixel RGB (e.g. straight from
-`np.asarray(pil_image, dtype=np.uint8).tobytes()`). There is no daemon and no
-shared memory -- this process alone owns the NIC and speaks the wire protocol.
+`np.asarray(pil_image, dtype=np.uint8).tobytes()`).
 
-Because there's no header and no delimiter, framing is just "read exactly
-canvas_w * canvas_h * 3 bytes, repeat" -- the sender MUST emit exactly that
-many bytes per frame, every frame. A wrongly-sized frame desyncs the stream
-permanently (every frame after it gets torn across the wrong boundaries)
-until the connection is dropped and reconnected.
-
-Wire protocol (reverse engineered from daemon/Linux_NetCard.cpp's
-send_frame(); dst MAC 11:22:33:44:55:66, src MAC 22:22:33:44:55:66, plain
-Ethernet frames, no IP/UDP, no 802.1Q):
-
-  1. Row-data frames, one or more per row (split into chunks of at most
-     COLS_PER_PKT columns):
-       ethertype = 0x5500 | (row >> 8)
-       payload   = row & 0xFF
-                 | col_offset (u16 BE)
-                 | chunk_len  (u16 BE)
-                 | 0x08 0x88
-                 | chunk_len * 3 bytes of BGR pixel data
-  2. An "enable"/latch frame, ethertype 0x0107, 98-byte zero payload except:
-       byte[21] = byte[24] = byte[25] = byte[26] = raw brightness (0-255)
-       byte[22] = 0x05
-  3. A brightness frame, ethertype 0x0A00 + gamma_brightness, 63-byte zero
-     payload except:
-       byte[0] = byte[1] = gamma-corrected brightness (0-255)
-       byte[2] = 0xFF
-
-Frames 2 and 3 must be sent after all row data for a frame -- they act as
-the vsync/latch + brightness commit. All packets belonging to one still
-frame are handed to the kernel in a single sendmmsg() batch (via ctypes --
-Python's socket module doesn't expose it) rather than one send() per packet,
-so the scheduler cannot preempt mid-frame and mix old/new row data.
+There is no daemon process and no polling: this program loads
+daemon/libnetcard.so (built from the ORIGINAL daemon/Linux_NetCard.cpp --
+see build_libnetcard.sh) via ctypes and calls its send_frame() directly, in
+this same process, the instant a new frame is ready. An earlier version of
+this file reimplemented the wire protocol from scratch in Python; it's gone
+now in favor of calling the real, tested C++ implementation, for two
+reasons: (1) it's the exact code path already validated on this hardware --
+see daemon/netcard_capi.cpp for the thin extern "C" wrapper that exposes it,
+and (2) the daemon's own polling loop (main.cpp's channel_thread checks a
+shared-memory command byte every usleep(1000000/FPS), ~16.7ms at 60Hz) adds
+latency and frame-to-frame jitter that a direct in-process call skips
+entirely.
 
 Requires root (or CAP_NET_RAW) to open the raw socket -- run this as root,
 or as the only network-facing half of the pipeline; the sender half
@@ -55,176 +35,70 @@ import ctypes
 import gc
 import os
 import socket
-import struct
 import sys
 import time
 
 import numpy as np
 
-DST_MAC = bytes.fromhex("112233445566")
-SRC_MAC = bytes.fromhex("222233445566")
-COLS_PER_PKT = 497  # keeps a single row-chunk frame under ~1.5KB
+_LIBNETCARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "libnetcard.so")
 
 
-class _Iovec(ctypes.Structure):
-    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+class NativeMatrix:
+    """Thin ctypes wrapper around daemon/libnetcard.so, i.e. around the
+    original Linux_NetCard::send_frame() -- same wire-protocol code the
+    daemon uses, called directly and synchronously from this process."""
 
+    def __init__(self, iface, rows, cols, brightness=100, channel=0):
+        try:
+            self._lib = ctypes.CDLL(_LIBNETCARD_PATH, use_errno=True)
+        except OSError as exc:
+            raise SystemExit(
+                "%s\ncouldn't load %s -- build it first:\n  cd daemon && ./build_libnetcard.sh"
+                % (exc, _LIBNETCARD_PATH)
+            )
 
-class _Msghdr(ctypes.Structure):
-    _fields_ = [
-        ("msg_name", ctypes.c_void_p),
-        ("msg_namelen", ctypes.c_uint32),
-        ("msg_iov", ctypes.POINTER(_Iovec)),
-        ("msg_iovlen", ctypes.c_size_t),
-        ("msg_control", ctypes.c_void_p),
-        ("msg_controllen", ctypes.c_size_t),
-        ("msg_flags", ctypes.c_int),
-    ]
+        self._lib.netcard_create.restype = ctypes.c_void_p
+        self._lib.netcard_create.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+        self._lib.netcard_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.netcard_buffer.restype = ctypes.c_void_p
+        self._lib.netcard_buffer.argtypes = [ctypes.c_void_p]
+        self._lib.netcard_rows.restype = ctypes.c_uint32
+        self._lib.netcard_rows.argtypes = [ctypes.c_void_p]
+        self._lib.netcard_cols.restype = ctypes.c_uint32
+        self._lib.netcard_cols.argtypes = [ctypes.c_void_p]
+        self._lib.netcard_send_frame.restype = ctypes.c_int
+        self._lib.netcard_send_frame.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint16]
+        self._lib.netcard_set_brightness.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
 
+        self._handle = self._lib.netcard_create(iface.encode(), channel, rows, cols)
+        if not self._handle:
+            err = ctypes.get_errno()
+            raise SystemExit("netcard_create(%r) failed: %s" % (iface, os.strerror(err)))
 
-class _Mmsghdr(ctypes.Structure):
-    _fields_ = [("msg_hdr", _Msghdr), ("msg_len", ctypes.c_uint)]
+        self.rows = self._lib.netcard_rows(self._handle)
+        self.cols = self._lib.netcard_cols(self._handle)
 
-
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
-_libc.sendmmsg.restype = ctypes.c_int
-_libc.sendmmsg.argtypes = [ctypes.c_int, ctypes.POINTER(_Mmsghdr), ctypes.c_uint, ctypes.c_uint]
-
-
-class RawMatrix:
-    """Talks directly to a 5A-75-style receiver card over a raw Ethernet
-    socket. No daemon, no shared memory.
-
-    Mirrors daemon/Linux_NetCard.cpp's send_frame(): that C++ code builds a
-    2-iovec sendmmsg() scatter/gather per row (a tiny header buffer plus a
-    pointer straight into the mmap'd shared-memory framebuffer for the pixel
-    bytes) and does zero per-frame allocation. Our first pass at this instead
-    rebuilt every packet and every ctypes structure from scratch each call
-    (~1.6ms just for packet construction, ~5.9ms per send_frame() total on a
-    Pi) -- slow enough, held open long enough on a still frame, that it could
-    race the receiver card's own scan-out and tear.
-
-    So: everything that doesn't change frame to frame -- header bytes, the
-    ctypes iovec/mmsghdr arrays -- is built once here at construction time.
-    self._bgr is a persistent buffer that the row-packet iovecs point into
-    directly; send_frame() only overwrites it in place and fires two
-    sendmmsg() syscalls. No per-frame allocation, no per-packet Python object
-    construction.
-    """
-
-    def __init__(self, iface, rows, cols, brightness=100):
-        self.rows = rows
-        self.cols = cols
-        self._raw_brightness = 0
-        self._gamma_brightness = 0
-
-        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        self.sock.bind((iface, 0))
-
-        # Overwritten in place every send_frame() call -- never reassigned,
-        # so its underlying memory address (and the iovec pointers into it
-        # built below) stay valid for the life of this object.
-        self._bgr = np.zeros((rows, cols, 3), dtype=np.uint8)
-        bgr_base = self._bgr.ctypes.data
-
-        chunks = []
-        for row in range(rows):
-            offset = 0
-            remaining = cols
-            while remaining > 0:
-                chunk = min(COLS_PER_PKT, remaining)
-                chunks.append((row, offset, chunk))
-                offset += chunk
-                remaining -= chunk
-        n = len(chunks)
-
-        # 2 iovecs per row packet (header, pixels-straight-from-self._bgr),
-        # plus 1 each for the enable/brightness packets at the tail.
-        self._iovecs = (_Iovec * (2 * n + 2))()
-        self._row_msgs = (_Mmsghdr * n)()
-        self._tail_msgs = (_Mmsghdr * 2)()
-        # ctypes.create_string_buffer copies own their memory -- keep them
-        # alive here, since the iovecs above only borrow pointers into them.
-        self._header_bufs = []
-
-        for i, (row, offset, chunk) in enumerate(chunks):
-            header = self._eth_header(0x5500 | (row >> 8)) + bytes((
-                row & 0xFF,
-                (offset >> 8) & 0xFF, offset & 0xFF,
-                (chunk >> 8) & 0xFF, chunk & 0xFF,
-                0x08, 0x88,
-            ))
-            buf = ctypes.create_string_buffer(header, len(header))
-            self._header_bufs.append(buf)
-
-            self._iovecs[2 * i].iov_base = ctypes.cast(buf, ctypes.c_void_p)
-            self._iovecs[2 * i].iov_len = len(header)
-            self._iovecs[2 * i + 1].iov_base = bgr_base + (row * cols + offset) * 3
-            self._iovecs[2 * i + 1].iov_len = chunk * 3
-
-            self._row_msgs[i].msg_hdr.msg_iov = ctypes.pointer(self._iovecs[2 * i])
-            self._row_msgs[i].msg_hdr.msg_iovlen = 2
-
-        self._tail_iov_base = 2 * n
-        for i in range(2):
-            self._tail_msgs[i].msg_hdr.msg_iov = ctypes.pointer(self._iovecs[self._tail_iov_base + i])
-            self._tail_msgs[i].msg_hdr.msg_iovlen = 1
+        buf_ptr = self._lib.netcard_buffer(self._handle)
+        buf_type = ctypes.c_uint8 * (self.rows * self.cols * 3)
+        # Matrix_RGB_t declares blue, green, red in that order -- this array
+        # IS the C++ object's live pixel buffer, not a copy.
+        self._bgr = np.ctypeslib.as_array(buf_type.from_address(buf_ptr)).reshape(self.rows, self.cols, 3)
 
         self.set_brightness(brightness)
 
     def set_brightness(self, percent):
-        percent = max(0, min(100, percent)) / 100.0
-        self._raw_brightness = round(percent * 255)
-        self._gamma_brightness = round((percent ** 0.405) * 255)
-
-        # Fixed for the life of the process in normal use, but rebuildable if
-        # something calls this again later -- cheap either way, only 2 packets.
-        enable = self._enable_frame()
-        brightness_pkt = self._brightness_frame()
-        self._enable_buf = ctypes.create_string_buffer(enable, len(enable))
-        self._brightness_buf = ctypes.create_string_buffer(brightness_pkt, len(brightness_pkt))
-
-        base = self._tail_iov_base
-        self._iovecs[base].iov_base = ctypes.cast(self._enable_buf, ctypes.c_void_p)
-        self._iovecs[base].iov_len = len(enable)
-        self._iovecs[base + 1].iov_base = ctypes.cast(self._brightness_buf, ctypes.c_void_p)
-        self._iovecs[base + 1].iov_len = len(brightness_pkt)
-
-    @staticmethod
-    def _eth_header(ethertype):
-        return DST_MAC + SRC_MAC + struct.pack(">H", ethertype & 0xFFFF)
-
-    def _enable_frame(self):
-        payload = bytearray(98)
-        payload[21] = self._raw_brightness
-        payload[22] = 0x05
-        payload[24] = payload[25] = payload[26] = self._raw_brightness
-        return self._eth_header(0x0107) + bytes(payload)
-
-    def _brightness_frame(self):
-        payload = bytearray(63)
-        payload[0] = payload[1] = self._gamma_brightness
-        payload[2] = 0xFF
-        return self._eth_header(0x0A00 + self._gamma_brightness) + bytes(payload)
+        self._lib.netcard_set_brightness(self._handle, max(0, min(100, percent)))
 
     def send_frame(self, rgb):
         """rgb: (rows, cols, 3) uint8 array in RGB order (e.g. from PIL)."""
         self._bgr[:] = rgb[:, :, ::-1]
-        fd = self.sock.fileno()
-
-        n = len(self._row_msgs)
-        sent = _libc.sendmmsg(fd, self._row_msgs, n, 0)
-        if sent != n:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err))
-
-        sent = _libc.sendmmsg(fd, self._tail_msgs, 2, 0)
-        if sent != 2:
+        if self._lib.netcard_send_frame(self._handle, 0, 0) != 0:
             err = ctypes.get_errno()
             raise OSError(err, os.strerror(err))
 
     def close(self):
-        self.sock.close()
+        self._lib.netcard_destroy(self._handle)
+        self._handle = None
 
 
 def build_mapper(canvas_w, canvas_h, recv_w, recv_h, mode):
@@ -356,7 +230,7 @@ def main():
         except ValueError:
             raise SystemExit("--receiver wants WxH, e.g. 192x192")
 
-    matrix = RawMatrix(args.iface, rows=recv_h, cols=recv_w, brightness=args.brightness)
+    matrix = NativeMatrix(args.iface, rows=recv_h, cols=recv_w, brightness=args.brightness)
     mapper = build_mapper(canvas_w, canvas_h, recv_w, recv_h, args.mapping)
     frame_bytes = canvas_w * canvas_h * 3
     min_frame_interval = 1.0 / args.max_fps if args.max_fps > 0 else 0.0
