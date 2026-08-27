@@ -135,6 +135,7 @@ my_animation | sudo ./python/bridge.py --iface eth0 --stdin
 | `--bind ADDR` | `127.0.0.1` | use `0.0.0.0` to accept frames from other machines |
 | `--stdin` | off | read the stream from stdin instead of a socket |
 | `--brightness N` | `100` | 0-100, fixed for the life of the process |
+| `--max-fps N` | `60` | cap on frames sent per second, `0` = unlimited. See [Performance](#performance). |
 | `--quiet` | off | suppress the throughput line printed every 5s |
 
 ### `--mapping none` vs `blocks`
@@ -162,7 +163,16 @@ in `--mapping none`) and building/sending the Ethernet packets, which
 `bridge.py` batches into a single `sendmmsg()` syscall per frame so the kernel
 transmits every packet in a still frame back-to-back.
 
-The practical ceiling is then almost entirely the wire:
+**`--max-fps` (default 60).** Without a cap, `bridge.py` sends a frame the
+instant it finishes reading one off the wire -- nothing paces it, so a fast
+sender (ffmpeg without `-re`, or a tight local pipe) can push frames faster
+than the receiver card can actually latch and display them, which is what
+causes tearing. `bridge.py` paces itself to at most this many frames/sec; if
+the sender pushes faster, TCP backpressure (the socket's send buffer filling
+up) naturally throttles it rather than the bridge dropping frames. Set it to
+`0` only if you've confirmed your panels can keep up with an unbounded rate.
+
+The practical ceiling below that cap is almost entirely the wire:
 
 - **Ethernet.** At 192x192 each frame is 192 packets of 597 bytes, about
   112 KB, so 60fps is **55 Mbit/s** and 30fps is **27 Mbit/s**. Fine on a Pi 4

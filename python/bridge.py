@@ -251,13 +251,20 @@ class RawFrameStream:
             yield payload
 
 
-def run(stream, matrix, mapper, canvas_w, canvas_h, quiet):
+def run(stream, matrix, mapper, canvas_w, canvas_h, quiet, min_frame_interval):
     frames = 0
     last = time.monotonic()
+    last_send = 0.0
 
     for payload in stream.frames():
+        if min_frame_interval:
+            wait = min_frame_interval - (time.monotonic() - last_send)
+            if wait > 0:
+                time.sleep(wait)
+
         src = np.frombuffer(payload, dtype=np.uint8).reshape(canvas_h, canvas_w, 3)
         matrix.send_frame(mapper(src))
+        last_send = time.monotonic()
         frames += 1
 
         if not quiet:
@@ -283,6 +290,10 @@ def main():
     ap.add_argument("--mapping", choices=["blocks", "none"], default="none",
                     help="'blocks' matches Matrix::map_pixel; 'none' writes straight through")
     ap.add_argument("--brightness", type=int, default=100, help="panel brightness 0-100 (default 100)")
+    ap.add_argument("--max-fps", type=float, default=60.0,
+                    help="cap on frames sent per second (default 60, 0 = unlimited). "
+                         "Protects the receiver card from frames landing faster than it can "
+                         "latch them, which is what causes tearing.")
     ap.add_argument("--quiet", action="store_true", help="do not print throughput")
     args = ap.parse_args()
 
@@ -302,10 +313,12 @@ def main():
     matrix = RawMatrix(args.iface, rows=recv_h, cols=recv_w, brightness=args.brightness)
     mapper = build_mapper(canvas_w, canvas_h, recv_w, recv_h, args.mapping)
     frame_bytes = canvas_w * canvas_h * 3
+    min_frame_interval = 1.0 / args.max_fps if args.max_fps > 0 else 0.0
 
     print(
-        "receiver %dx%d, canvas %dx%d (%d bytes/frame, raw RGB), mapping %s, iface %s"
-        % (recv_w, recv_h, canvas_w, canvas_h, frame_bytes, args.mapping, args.iface),
+        "receiver %dx%d, canvas %dx%d (%d bytes/frame, raw RGB), mapping %s, iface %s, max %s fps"
+        % (recv_w, recv_h, canvas_w, canvas_h, frame_bytes, args.mapping, args.iface,
+           args.max_fps if args.max_fps > 0 else "unlimited"),
         file=sys.stderr,
     )
 
@@ -315,7 +328,8 @@ def main():
 
     try:
         if args.stdin:
-            run(RawFrameStream(sys.stdin.buffer.read, frame_bytes), matrix, mapper, canvas_w, canvas_h, args.quiet)
+            run(RawFrameStream(sys.stdin.buffer.read, frame_bytes), matrix, mapper, canvas_w, canvas_h,
+                args.quiet, min_frame_interval)
             return
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -329,7 +343,8 @@ def main():
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print("connected: %s:%d" % peer, file=sys.stderr)
             try:
-                run(RawFrameStream(conn.recv, frame_bytes), matrix, mapper, canvas_w, canvas_h, args.quiet)
+                run(RawFrameStream(conn.recv, frame_bytes), matrix, mapper, canvas_w, canvas_h,
+                    args.quiet, min_frame_interval)
             finally:
                 conn.close()
                 print("disconnected", file=sys.stderr)
