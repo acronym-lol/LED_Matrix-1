@@ -1,16 +1,21 @@
 [Unit]
-Description=ACRONYM logo animation - three bouncing balls over jpeg-bridge
-After=network.target jpeg-bridge.service
-Requires=jpeg-bridge.service
+Description=ACRONYM logo animation - JPEG bridge + three bouncing balls
+After=network.target
 
 [Service]
 Type=simple
-User=zongze
+User=root
 WorkingDirectory=/home/zongze/Documents/LED_Matrix-1
+# bridge.py backgrounds itself here (no daemonizing of its own -- systemd's
+# cgroup tracks it as a descendant of this unit either way, same as the old
+# Matrix binary did). ExecStart below is the one process systemd supervises
+# and restarts on failure.
+ExecStartPre=/bin/bash -c '/usr/bin/python3 /home/zongze/Documents/LED_Matrix-1/python/bridge.py --iface eth0 --canvas 192x192 &'
 ExecStartPre=/bin/sleep 1
 ExecStart=/usr/bin/python3 /home/zongze/Documents/LED_Matrix-1/python/three_bouncing_balls.py
 Restart=on-failure
 RestartSec=2
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
