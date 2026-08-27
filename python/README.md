@@ -2,18 +2,20 @@
 
 Stream JPEG frames over a socket to a ColorLight 5A-75B / 5A-75E receiver card.
 
-`jpeg_bridge.py` sits between your animation program and the daemon in this
-repo. You send it JPEGs; it decodes them, arranges the pixels the way the
-receiver card expects, and hands them to the daemon, which does the actual
-Ethernet work.
+`bridge.py` sits between your animation program and the receiver card. You
+send it JPEGs; it decodes them, arranges the pixels the way the receiver card
+expects, and sends them straight out over a raw Ethernet socket. There is no
+daemon and no shared memory -- `bridge.py` is the only thing that touches the
+NIC.
 
 ```
-your program ──JPEG over TCP──► jpeg_bridge.py ──shared memory──► daemon ──Ethernet──► panels
-                                    (you)          /tmp/...mem      (root)
+your program ──JPEG over TCP──► bridge.py ──raw Ethernet──► panels
+                                  (root)
 ```
 
 Anything that can write to a socket can drive the display: ffmpeg, a Python
-script, a game engine, a shell pipeline. The bridge does not need root.
+script, a game engine, a shell pipeline. Only `bridge.py` itself needs root
+(or `CAP_NET_RAW`) -- your program does not.
 
 ---
 
@@ -35,76 +37,41 @@ How you divide 192x192 across the card's HUB75 output connectors (say nine
 Once the card is configured, it presents a single flat 192x192 raster and the
 bridge writes to that.
 
-Whatever number you set here **must** match the daemon config in the next step.
-There is no negotiation and no error if they disagree — you just get garbage.
+Whatever number you set here **must** match `bridge.py`'s `--receiver` flag
+(or `--canvas`, if you leave `--receiver` unset). There is no negotiation and
+no error if they disagree -- you just get garbage.
 
-## 2. Configure and start the daemon
-
-Build it:
-
-```bash
-cd daemon
-g++ -O3 PIC32MZ_NetCard.cpp Linux_NetCard.cpp main.cpp network.cpp -o Matrix -lpthread -lusb-1.0
-```
-
-Edit `daemon/config.txt`. Four lines per channel, no blank lines:
-
-```
-0 8080
-eth0
-192 192
-0 0
-```
-
-| Line | Meaning |
-|---|---|
-| `0 8080` | channel number, then the daemon's own TCP port (unrelated to the bridge) |
-| `eth0` | the NIC wired to the receiver card — check yours with `ip link` |
-| `192 192` | rows then columns, matching the receiver card exactly |
-| `0 0` | VLAN off, VLAN id unused |
-
-> **End the file with a newline.** The config parser drops the last channel if
-> the file ends without one — see the `!cfg.eof()` check in `main.cpp`.
-
-Start it (root is required for raw Ethernet frames):
-
-```bash
-sudo ./Matrix config.txt
-```
-
-It daemonizes immediately and creates `/tmp/LED_Matrix-0.mem`, the shared
-framebuffer. The bridge will not start until this file exists.
-
-## 3. Install the bridge's dependencies
+## 2. Install the bridge's dependencies
 
 ```bash
 sudo apt install python3-numpy python3-pil
 ```
 
-Pillow is doing the JPEG decoding through libjpeg-turbo — the same C library a
+Pillow is doing the JPEG decoding through libjpeg-turbo -- the same C library a
 C++ version would use, so decoding runs at full native speed. numpy keeps the
 pixel rearranging out of the Python interpreter. Both matter; see
 [Performance](#performance).
 
-## 4. Start the bridge
+## 3. Start the bridge
 
 ```bash
-./python/jpeg_bridge.py
+sudo ./python/bridge.py --iface eth0
 ```
 
-The defaults are already 192x192 with no remapping. It prints what it negotiated and waits:
+`--iface` is the NIC wired to the receiver card -- check yours with `ip link`.
+This needs root because it opens a raw `AF_PACKET` socket.
+
+The defaults are already 192x192 with no remapping. It prints what it's using
+and waits:
 
 ```
-receiver 192x192, canvas 192x192, mapping none
+receiver 192x192, canvas 192x192, mapping none, iface eth0
 listening on 127.0.0.1:9000
 ```
 
-The receiver size is read from the daemon, not from your flags, so if this line
-does not say `192x192` your `config.txt` is wrong.
+## 4. Send it frames
 
-## 5. Send it frames
-
-**From ffmpeg** — no code at all. Scale to the panel size in ffmpeg, not in the
+**From ffmpeg** -- no code at all. Scale to the panel size in ffmpeg, not in the
 bridge (this matters a lot, see [Performance](#performance)):
 
 ```bash
@@ -122,7 +89,7 @@ ffmpeg -loop 1 -r 1 -i logo.png -vf scale=192:192 -f mjpeg tcp://127.0.0.1:9000
 `-re` throttles playback to real time. Without it ffmpeg pushes frames as fast
 as it can decode them.
 
-**From Python** — send whole JPEGs back to back:
+**From Python** -- send whole JPEGs back to back:
 
 ```python
 import io, socket
@@ -139,10 +106,13 @@ while True:
     show(render_next_frame())
 ```
 
-**From a pipe** — skip the socket entirely:
+`bouncing_ball.py`, `flash_rgb.py` and `three_bouncing_balls.py` in this
+directory are working examples of this.
+
+**From a pipe** -- skip the socket entirely:
 
 ```bash
-my_animation | ./python/jpeg_bridge.py --stdin
+my_animation | sudo ./python/bridge.py --iface eth0 --stdin
 ```
 
 ---
@@ -151,23 +121,24 @@ my_animation | ./python/jpeg_bridge.py --stdin
 
 | Flag | Default | Notes |
 |---|---|---|
+| `--iface IFACE` | *(required)* | NIC wired to the receiver card, e.g. `eth0` |
 | `--canvas WxH` | `192x192` | size of the frames you are sending |
+| `--receiver WxH` | same as `--canvas` | the receiver card's actual configured resolution |
 | `--mapping` | `none` | `none` sends pixels straight through. See below. |
-| `--channel N` | `0` | which daemon channel, i.e. which `/tmp/LED_Matrix-N.mem` |
 | `--port N` | `9000` | TCP port to listen on |
 | `--bind ADDR` | `127.0.0.1` | use `0.0.0.0` to accept frames from other machines |
 | `--stdin` | off | read the stream from stdin instead of a socket |
 | `--fit` | `stretch` | `contain` preserves aspect ratio and letterboxes with black |
-| `--brightness N` | unset | 0–100, applied once at startup |
+| `--brightness N` | `100` | 0-100, fixed for the life of the process |
 | `--quiet` | off | suppress the throughput line printed every 5s |
 
 ### Framing
 
 Auto-detected per connection, so you do not configure it:
 
-- **Back-to-back JPEGs** — each frame starts `FF D8` and ends `FF D9`. This is
+- **Back-to-back JPEGs** -- each frame starts `FF D8` and ends `FF D9`. This is
   what `ffmpeg -f mjpeg` emits and what the Python snippet above sends.
-- **Length-prefixed** — a 4-byte big-endian length before each JPEG. Slightly
+- **Length-prefixed** -- a 4-byte big-endian length before each JPEG. Slightly
   more robust: a JPEG carrying an EXIF thumbnail can contain an early `FF D9`,
   which costs one dropped frame in the first mode before it resynchronizes.
 
@@ -190,7 +161,7 @@ silently displaying nonsense.
 
 ## Performance
 
-Measured on Apple Silicon. A Pi 4 is roughly 3–5x slower, so divide.
+Measured on Apple Silicon. A Pi 4 is roughly 3-5x slower, so divide.
 
 | Workload | Decode | Map + copy | Total | Ceiling |
 |---|---|---|---|---|
@@ -205,16 +176,16 @@ almost all of them away. On a Pi that is the difference between comfortable and
 struggling. **Always scale to 192x192 in ffmpeg**, so the bridge only ever sees
 small JPEGs.
 
-The bridge is not your bottleneck. Two other things are:
+Unlike the older daemon-backed design, there is no fixed polling interval
+here -- `bridge.py` sends a frame as soon as it finishes decoding and mapping
+it, batching every packet of that frame into a single `sendmmsg()` syscall so
+the kernel transmits them back-to-back. The practical ceiling is then whatever
+is slower of your source (decode above) and the wire:
 
-- **The daemon polls at 60 Hz.** `const int FPS = 60` in `daemon/main.cpp` means
-  every frame waits up to 16.6 ms for the daemon to notice it. This caps you
-  near 60fps no matter how fast anything else is. Lowering that sleep is a
-  one-line change.
 - **Ethernet.** At 192x192 each frame is 192 packets of 597 bytes, about
   112 KB, so 60fps is **55 Mbit/s** and 30fps is **27 Mbit/s**. Fine on a Pi 4
   or 5 with real gigabit. A Pi 3 or earlier puts Ethernet behind USB2 at
-  100 Mbit, where 60fps would be uncomfortably close to the ceiling — use 30fps
+  100 Mbit, where 60fps would be uncomfortably close to the ceiling -- use 30fps
   there, or use a newer Pi.
 
 ### Wiring
@@ -222,51 +193,37 @@ The bridge is not your bottleneck. Two other things are:
 These are raw L2 frames with hardcoded MAC addresses and non-IP ethertypes. A
 normal switch cannot learn them and will flood the segment. In practice the
 Pi's Ethernet port goes to the receiver card and nothing else, and you use WiFi
-for everything else. If you must share the link, use the VLAN fields in
-`config.txt`.
+for everything else.
 
 ---
 
 ## Troubleshooting
 
-**`/tmp/LED_Matrix-0.mem does not exist -- is the daemon running?`**
-Start the daemon first; it creates the file. Check it survived startup with
-`pgrep Matrix` — it daemonizes silently and exits silently on a bad config.
+**`PermissionError` / `Operation not permitted` on startup.**
+`bridge.py` needs root (or `CAP_NET_RAW`) to open a raw socket. Run it with
+`sudo`.
 
-**`shared memory is N bytes but 192x192 needs 110596`**
-The file is left over from a run at a different resolution. Stop the daemon,
-`rm /tmp/LED_Matrix-0.mem`, start it again.
-
-**`daemon did not answer command 3`**
-The file exists but nothing is servicing it — a dead daemon from a previous
-run. Same fix as above.
-
-**The bridge prints a different receiver size than 192x192.**
-`config.txt` disagrees with what you think it says. Remember it is
-rows-then-columns, and that a missing trailing newline silently drops the last
-channel.
+**The bridge prints a different receiver size than you expected.**
+`--receiver` (or `--canvas`, if `--receiver` is unset) disagrees with what you
+think it says. Remember it's WxH, and it must match what LEDVision has the
+card configured to.
 
 **Nothing on the panels, but the bridge reports frames flowing.**
-The daemon is sending to the wrong NIC, or the cable is on the wrong port. Check
-the interface name in `config.txt` against `ip link`, and confirm packets are
-actually leaving:
+Check the interface name against `ip link`, and confirm packets are actually
+leaving:
 `sudo tcpdump -i eth0 -c 10 'ether proto 0x0107 or ether[12:2] > 0x5500'`
 
 **The image is scrambled, sliced or offset.**
 Receiver card configuration, not this software. The card's resolution in
-LEDVision must match `config.txt`, and the panel chain layout in LEDVision must
+LEDVision must match `--receiver`, and the panel chain layout in LEDVision must
 match how the panels are physically wired.
-
-**Occasional torn frames.** The framebuffer is single-buffered — the daemon can
-be reading it while the bridge writes the next frame. The bridge minimizes the
-window by decoding into scratch memory and doing one copy in, but eliminating
-it needs double buffering in the daemon.
 
 **Random flickering on PWM/MM panels.** Not a bug in the bridge. The main
 README documents that MBI5153-class panels glitch when frames change
-continuously from userspace Linux, because the timing is not tight enough. The
-bridge calls `gc.disable()` to remove one source of pauses, but the underlying
-issue is in how Linux paces the packets. Non-PWM panels are unaffected.
+continuously from userspace Linux, because the timing is not tight enough.
+`bridge.py` calls `gc.disable()` and batches every frame into one `sendmmsg()`
+call to remove two sources of jitter, but the underlying issue is in how Linux
+paces the packets. Non-PWM panels are unaffected.
 
 ---
 
@@ -274,11 +231,8 @@ issue is in how Linux paces the packets. Non-PWM panels are unaffected.
 
 ```bash
 # terminal 1
-cd daemon && sudo ./Matrix config.txt
+sudo ./python/bridge.py --iface eth0
 
 # terminal 2
-./python/jpeg_bridge.py
-
-# terminal 3
 ffmpeg -re -i clip.mp4 -vf scale=192:192 -f mjpeg tcp://127.0.0.1:9000
 ```
